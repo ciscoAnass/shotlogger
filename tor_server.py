@@ -1,7 +1,12 @@
+import sys
 import json
 from pathlib import Path
 from datetime import datetime
 from functools import wraps
+import getpass
+import os
+import hashlib
+import hmac
 
 from flask import (
     Flask, request, redirect, url_for,
@@ -10,7 +15,10 @@ from flask import (
 )
 from werkzeug.utils import secure_filename
 
-# ---- Load config ----
+
+# ==========================================================
+#  Config loading
+# ==========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "server_config.json"
@@ -23,13 +31,14 @@ with CONFIG_FILE.open("r", encoding="utf-8") as f:
 
 ROOT_FOLDER = Path(cfg.get("root_folder", "/home/youruser/shotlogger_data"))
 WEB_USERNAME = cfg.get("web_username", "admin")
-WEB_PASSWORD = cfg.get("web_password", "changeme")
+WEB_PASSWORD = cfg.get("web_password", "")  # legacy/plaintext (optional)
+WEB_PASSWORD_HASH = cfg.get("web_password_hash", "")  # pbkdf2 hash
 UPLOAD_PASSWORD = cfg.get("upload_password", "change_me")
 SITE_NAME = cfg.get("site_name", "ShotLogger")
-SESSION_SECRET = cfg.get("session_secret")
+SESSION_SECRET = cfg.get("session_secret")  # optional
 
 if not SESSION_SECRET:
-    # Fallback: derive from upload password
+    # fallback: derive from upload password (good enough for personal use)
     SESSION_SECRET = UPLOAD_PASSWORD + "_flask_secret"
 
 ROOT_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -38,10 +47,110 @@ app = Flask(__name__)
 app.secret_key = SESSION_SECRET.encode("utf-8")
 
 
-# ---- Security headers ----
+# ==========================================================
+#  Password hashing helpers (PBKDF2-SHA256)
+# ==========================================================
+
+def hash_password(plain_password: str, iterations: int = 200_000) -> str:
+    """
+    Hash a password using PBKDF2-HMAC-SHA256.
+
+    Returns a string like:
+      pbkdf2_sha256$200000$<salt_hex>$<hash_hex>
+    """
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        plain_password.encode("utf-8"),
+        salt,
+        iterations,
+    )
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${dk.hex()}"
+
+
+def verify_hashed_password(plain_password: str, stored: str) -> bool:
+    """
+    Verify a password against a stored PBKDF2-SHA256 hash string.
+    """
+    try:
+        algo, iter_str, salt_hex, hash_hex = stored.split("$", 3)
+    except ValueError:
+        return False
+
+    if algo != "pbkdf2_sha256":
+        return False
+
+    try:
+        iterations = int(iter_str)
+        salt = bytes.fromhex(salt_hex)
+        stored_hash = bytes.fromhex(hash_hex)
+    except (ValueError, TypeError):
+        return False
+
+    test_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        plain_password.encode("utf-8"),
+        salt,
+        iterations,
+    )
+    return hmac.compare_digest(stored_hash, test_hash)
+
+
+def verify_web_password(plain_password: str) -> bool:
+    """
+    Verify the admin web password.
+
+    Priority:
+      - If WEB_PASSWORD_HASH is set -> use PBKDF2.
+      - Else -> fall back to plaintext WEB_PASSWORD comparison.
+    """
+    if WEB_PASSWORD_HASH:
+        return verify_hashed_password(plain_password, WEB_PASSWORD_HASH)
+    else:
+        return plain_password == WEB_PASSWORD
+
+
+def set_admin_password_interactive() -> None:
+    """
+    CLI helper: python tor_server.py --set-admin-password
+
+    Prompts for a new admin web password, hashes it, and writes it
+    into server_config.json as web_password_hash.
+    """
+    print("This will set (or reset) the ADMIN web password for the ShotLogger UI.")
+    pw1 = getpass.getpass("New web password: ")
+    pw2 = getpass.getpass("Repeat web password: ")
+
+    if pw1 != pw2:
+        print("Passwords do not match. Aborting.")
+        return
+
+    if not pw1:
+        print("Password cannot be empty. Aborting.")
+        return
+
+    new_hash = hash_password(pw1)
+
+    with CONFIG_FILE.open("r", encoding="utf-8") as f:
+        current_cfg = json.load(f)
+
+    current_cfg["web_password_hash"] = new_hash
+    current_cfg["web_password"] = ""
+
+    with CONFIG_FILE.open("w", encoding="utf-8") as f:
+        json.dump(current_cfg, f, indent=4)
+
+    print("Admin web password updated successfully.")
+    print("You can now run the server normally or via gunicorn.")
+
+
+# ==========================================================
+#  Security helpers
+# ==========================================================
 
 @app.after_request
 def set_security_headers(response):
+    # Basic hardening
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -50,8 +159,6 @@ def set_security_headers(response):
     ] = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';"
     return response
 
-
-# ---- auth helper ----
 
 def login_required(f):
     @wraps(f)
@@ -62,15 +169,20 @@ def login_required(f):
     return wrapper
 
 
-# ---- small validation (avoid ../ etc.) ----
-
 def validate_identifier(value: str) -> bool:
-    # Very simple: avoid path separators
+    """
+    Avoid path traversal with very simple checks:
+    - no / or \ characters
+    - non-empty
+    """
     if not value:
         return False
     return ("/" not in value) and ("\\" not in value)
 
 
+# ==========================================================
+#  HTML TEMPLATES (white UI + click-to-preview)
+# ==========================================================
 
 LOGIN_TEMPLATE = """
 <!doctype html>
@@ -316,6 +428,7 @@ USER_TEMPLATE = """
     }
     a.link:hover { text-decoration: underline; }
     .back { margin-top: 12px; font-size: 14px; }
+    .meta { font-size: 13px; color: #6b7280; }
   </style>
 </head>
 <body>
@@ -510,7 +623,9 @@ DAY_TEMPLATE = """
 """
 
 
-# ---- Web routes ----
+# ==========================================================
+#  Web routes
+# ==========================================================
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -518,7 +633,7 @@ def login():
     if request.method == "POST":
         user = request.form.get("username", "")
         pw = request.form.get("password", "")
-        if user == WEB_USERNAME and pw == WEB_PASSWORD:
+        if user == WEB_USERNAME and verify_web_password(pw):
             session["logged_in"] = True
             next_url = request.args.get("next") or url_for("index")
             return redirect(next_url)
@@ -615,7 +730,9 @@ def serve_file(username, day, filename):
     return send_from_directory(day_dir, filename)
 
 
-# ---- API upload ----
+# ==========================================================
+#  API upload
+# ==========================================================
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
@@ -648,5 +765,15 @@ def api_upload():
     return {"status": "ok", "path": str(dest)}, 200
 
 
+# ==========================================================
+#  Main entry point
+# ==========================================================
+
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    if "--set-admin-password" in sys.argv:
+        set_admin_password_interactive()
+    else:
+        # Dev server only. For real use, prefer gunicorn:
+        #   gunicorn --bind 127.0.0.1:5000 --workers 3 --threads 4 tor_server:app
+        app.run(host="192.168.0.24", port=5000, debug=False)
+
