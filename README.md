@@ -22,7 +22,9 @@ These are **false positives** caused by:
 - Screenshots being taken programmatically
     
 - Network communication through Tor
-    
+
+<img width="1087" height="587" alt="torcap" src="https://github.com/user-attachments/assets/2911b3e6-1e14-4eae-8ef7-1f8b15dbcb6e" />
+
 ---
 
 ## 1. Architecture Overview
