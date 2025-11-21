@@ -1,387 +1,447 @@
-# ShotLogger (ScreenGuard) – Personal Screen Screenshot Logger
+# ShotLogger – Self‑Hosted Tor Screen Logger (Personal Use Only)
 
-> ⚠️ **Ethical / Legal Use Only**  
-> This tool is designed **only for logging your own screen** on a computer you own or administrate, and **only where such logging is legal**.  
-> Do **NOT** use it to spy on other people, shared computers, or accounts you do not own.
+ShotLogger is a **personal** tool that:
+
+- Captures screenshots on your **own Windows accounts** at a fixed interval.
+- Sends them over **Tor** to your **own Debian server** running a private `.onion` site.
+- Lets you browse screenshots per **Windows username** and **date** via a simple web UI in Tor Browser.
+
+> ⚠️ This is for **your own machines and accounts only**.  
+> Do **not** use it to spy on other people or devices you do not own or control.  
+> The design is transparent and avoids stealthy / malware‑style behavior as much as possible.
+
+The compiled ShotLogger.exe has already been scanned for transparency — you can view the full VirusTotal analysis here: [Total Virus Result](https://www.virustotal.com/gui/file/30bb13ebf1b993ff8ef7d6b4166175ee392b832c195109f902bc0069e5fb671a)
+
+⚠️ **Note:** Tools compiled with PyInstaller often trigger **generic flags** such as  
+_"Win64:Malware-gen"_, _"Suspicious PE"_, or _"BehavesLike.Win64.Generic"_.  
+
+These are **false positives** caused by:
+
+- The executable being packed into a single file
+    
+- Screenshots being taken programmatically
+    
+- Network communication through Tor
+    
+---
+
+## 1. Architecture Overview
+
+There are two components:
+
+1. **Server (Debian 13)** – `tor_server.py`
+   - Runs a Flask web app on `127.0.0.1:5000`.
+   - Exposed via Tor as a **hidden service** (e.g. `xyz123.onion`).
+   - Stores screenshots on disk under a root folder, like:
+     ```text
+     /home/youruser/shotlogger_data/
+       ├─ CiscoAnass/
+       │   ├─ 21-11-2025/
+       │   │   ├─ screenshot_20251121_000918.png
+       │   │   └─ ...
+       └─ nesrino186/
+           └─ 22-11-2025/
+     ```
+   - Web UI (via Tor Browser):
+     - Login with your admin credentials.
+     - See **users → days → thumbnails**, and click thumbnails to preview full images.
+
+2. **Client (Windows)** – `app.py` → `ShotLogger.exe`
+   - Runs in the background when the user logs in (via Task Scheduler).
+   - Takes screenshots every _N_ seconds (default `10`).
+   - Stores them temporarily in a local folder (e.g. `C:\Users\CiscoAnass\Pictures\Security\DD-MM-YYYY`).
+   - Periodically batches uploads to the Tor server over a SOCKS proxy (`Tor`).
+   - After a successful upload, it **deletes** the local screenshot.
+   - Enforces a max local folder size (MB) and deletes oldest non‑pending files when above the limit.
+
+Everything is configured through **JSON files**, no environment variables needed.
 
 ---
 
-## Overview
+## 2. Requirements
 
-ShotLogger (a.k.a. ScreenGuard) is a small Windows utility that:
+### 2.1 Server (Debian 13)
 
-- Runs in the background while you are logged into Windows.
-- Takes a screenshot every **N seconds** (configurable, default: 10s).
-- Stores screenshots in a **local folder tree** organized by **date**:
-  - `C:/Users/You/Pictures/Security/21-11-2025/screenshot_20251121_101530.png`
-- Optionally uploads screenshots to **MEGA**:
-  - Uses your **Windows username** as the root folder name on MEGA.
-  - Inside MEGA it creates **per-day folders** like `CiscoAnass/21-11-2025/…`.
-  - Uploads are done in **batches** (e.g. 10 screenshots at a time).
-  - After a successful upload, the local file is **deleted permanently** (no Recycle Bin).
-- Works **offline**:
-  - Keeps taking screenshots even without internet.
-  - When the internet returns, it uploads the backlog in batches.
-- Protects your disk by:
-  - Applying a configurable **size limit** to the screenshot folder tree.
-  - Automatically deleting the oldest (already uploaded) screenshots when the limit is exceeded.
+- Debian 13 (or similar Linux)
+- `python3`, `python3-venv`, `python3-pip`
+- `tor`
+- Python packages (inside a venv):
+  - `flask`
 
----
+### 2.2 Windows Client
 
-## Requirements
+For **building** the EXE:
 
-- **Operating System**: Windows 10 / 11
-- **Python**: **3.10.x** (recommended)
+- Windows 10/11 64‑bit
+- Python 3.10+ (you used 3.14)
+- `pip`
+- Python packages (inside a venv):
+  - `mss`
+  - `requests`
+  - `pysocks`
+  - `pyinstaller` (for building the EXE)
 
-> ⚠️ `mega.py` has compatibility issues with Python ≥ 3.11 because of its dependency on older `tenacity` and `asyncio`.  
-> Use **Python 3.10** for this project to avoid runtime errors.
+For **running** the EXE on each Windows PC:
 
-Python packages (installed into a virtual environment):
-
-- `mss` – efficient cross-platform screenshot capture
-- `mega.py` – MEGA API client
+- Only the **built EXE** (e.g. `ShotLogger.exe`)
+- A matching `config.json` in the same folder
+- Tor connectivity (typically Tor Browser or Tor service providing a SOCKS proxy on `127.0.0.1:9050` or `127.0.0.1:9150`)
 
 ---
 
-## Project Structure
+## 3. Server Setup (Debian 13)
 
-Example structure:
+### 3.1 Create project folder and virtualenv
 
-```text
-shotlogger/
-├─ app.py
-├─ config.json
-└─ venv/              # (optional) Python virtual environment
+```bash
+sudo apt update
+sudo apt install python3 python3-venv python3-pip tor
+
+mkdir -p ~/shotlogger
+cd ~/shotlogger
+
+python3 -m venv venv
+source venv/bin/activate
+
+pip install flask
 ```
 
-Runtime folder structure (local screenshots):
+Copy these files into `~/shotlogger`:
 
-```text
-C:/Users/<YourUser>/Pictures/Security/
-└─ 21-11-2025/
-   ├─ screenshot_20251121_101500.png
-   ├─ screenshot_20251121_101510.png
-   └─ ...
+- `tor_server.py`
+- `server_config.json` (you will create it in the next step)
+
+### 3.2 Create `server_config.json`
+
+In `~/shotlogger/server_config.json`:
+
+```json
+{
+  "root_folder": "/home/youruser/shotlogger_data",
+  "web_username": "anass",
+  "web_password": "CHANGE_THIS_WEB_PASSWORD",
+  "upload_password": "CHANGE_THIS_UPLOAD_PASSWORD",
+  "site_name": "ShotLogger",
+  "session_secret": "CHANGE_THIS_SESSION_SECRET"
+}
 ```
 
-MEGA folder structure:
+- `root_folder` – where screenshots are stored on the server.
+- `web_username` / `web_password` – credentials for the **web UI** (Tor Browser).  
+- `upload_password` – **shared secret** between server and Windows clients.  
+  - This must match `upload_password` in each Windows `config.json`.
+- `site_name` – title displayed on the site.
+- `session_secret` – long random string used to secure Flask sessions.
 
-```text
-<MEGA Root>/
-└─ <WindowsUsername>/
-   ├─ 18-11-2025/
-   ├─ 19-11-2025/
-   └─ 21-11-2025/
-       ├─ screenshot_20251121_101500.png
-       └─ ...
+> ⚠️ Keep this file private. It never leaves your Debian server.
+
+### 3.3 Configure Tor Hidden Service
+
+Edit Tor config:
+
+```bash
+sudo nano /etc/tor/torrc
 ```
 
-Where `<WindowsUsername>` is detected automatically (e.g. `CiscoAnass`, `AnassWork`, etc.).
+Add this at the end (if not already present):
+
+```text
+HiddenServiceDir /var/lib/tor/shotlogger_service/
+HiddenServicePort 80 127.0.0.1:5000
+```
+
+Save and restart Tor:
+
+```bash
+sudo systemctl restart tor
+```
+
+Get your `.onion` address:
+
+```bash
+sudo cat /var/lib/tor/shotlogger_service/hostname
+```
+
+Example output:
+
+```text
+nlbsg4kl2itgwcu5g6ysikwmx77lavxb5kh2c36mg7wlmazn2332hhid.onion
+```
+
+This is the URL you will use in:
+
+- Tor Browser (to access the web UI)
+- Windows `config.json` as `server_url`.
+
+### 3.4 Run the Flask server
+
+From `~/shotlogger`:
+
+```bash
+cd ~/shotlogger
+source venv/bin/activate
+python tor_server.py
+```
+
+The app listens on `127.0.0.1:5000`. Tor exposes it via your `.onion` domain.
+
+Open Tor Browser and go to:
+
+```text
+http://YOUR_ONION_HOSTNAME.onion/
+```
+
+Log in using `web_username` / `web_password` from `server_config.json`.
+
+You should see:
+
+- A **Users** list (e.g. `CiscoAnass`, `AnassWork`, etc.)
+- Clicking a user shows available **days**.
+- Clicking a day shows all screenshots as thumbnails.
+- Clicking a thumbnail opens a **full preview modal**.
 
 ---
 
-## Configuration (`config.json`)
+## 4. Windows Client Setup (builder machine)
+
+You only need to do this on the machine where you **build** `ShotLogger.exe`.
+
+### 4.1 Create project folder & virtualenv
+
+On Windows (PowerShell):
+
+```powershell
+cd C:\Users\YourUser\Desktop
+mkdir shotlogger
+cd .\shotlogger
+
+python -m venv venv
+.\venv\Scripts\activate
+
+pip install mss requests pysocks pyinstaller
+```
+
+Copy into this folder:
+
+- `app.py` (ShotLogger client)
+- `config.json` (client config template)
+
+### 4.2 Create `config.json` (client)
 
 Example `config.json`:
 
 ```json
 {
-    "interval_seconds": 10,
-    "screenshot_folder": "C:/Users/CiscoAnass/Pictures/Security",
-    "enable_mega": true,
-    "mega_email": "YOUR_MEGA_EMAIL",
-    "mega_password": "YOUR_MEGA_PASSWORD",
-    "upload_batch_size": 10,
-    "max_folder_size_mb": 500,
-    "log_file": "screen_guard.log"
+  "interval_seconds": 10,
+  "screenshot_folder": "C:/Users/CiscoAnass/Pictures/Security",
+  "server_url": "http://nlbsg4kl2itgwcu5g6ysikwmx77lavxb5kh2c36mg7wlmazn2332hhid.onion",
+  "upload_password": "CHANGE_THIS_UPLOAD_PASSWORD",
+  "upload_batch_size": 10,
+  "max_folder_size_mb": 500,
+  "tor_socks_proxy": "socks5h://127.0.0.1:9050",
+  "log_file": "screen_guard.log"
 }
 ```
 
-### Fields
+- `interval_seconds` – capture interval in seconds.
+- `screenshot_folder` – base folder; client will create subfolders per day (`DD-MM-YYYY`).
+- `server_url` – your `.onion` address from `hostname` (use `http://`, not https).
+- `upload_password` – must match `upload_password` from `server_config.json`.
+- `upload_batch_size` – how many screenshots to upload at once.
+- `max_folder_size_mb` – maximum local disk usage before rotation starts deleting oldest non‑pending files.
+- `tor_socks_proxy`:
+  - If Tor is running as a service: usually `socks5h://127.0.0.1:9050`
+  - If using Tor Browser only: often `socks5h://127.0.0.1:9150`
+- `log_file` – log file name (stored next to the EXE by default).
 
-- `interval_seconds`  
-  - Delay between screenshots (in seconds).  
-  - Example: `10` → one screenshot every 10 seconds.
-
-- `screenshot_folder`  
-  - Root folder for **local screenshots**.  
-  - The app creates a **per-day subfolder** inside it:
-    - `screenshot_folder/DD-MM-YYYY/…`.
-
-- `enable_mega`  
-  - `true` to enable uploads to MEGA, `false` to keep everything local.
-
-- `mega_email` / `mega_password`  
-  - Credentials for your dedicated MEGA account.  
-  - **Security tip**: Use a separate MEGA account just for this app.
-
-- `upload_batch_size`  
-  - Number of screenshots to accumulate before attempting an upload.  
-  - Example: `10` → captures 10 screenshots (about 100 seconds at 10s interval), then uploads the 10 files in one batch.
-
-- `max_folder_size_mb`  
-  - Maximum size (in MB) for the **full screenshot tree** under `screenshot_folder`.  
-  - When exceeded, the app deletes old screenshots (across all days), **except those still pending upload**.
-
-- `log_file`  
-  - Name/path of the log file.  
-  - Example entries:
-    - `Screenshot saved: C:\Users\...\21-11-2025\screenshot_20251121_101500.png`
-    - `Uploading ... to MEGA folder CiscoAnass/21-11-2025...`
-    - `Uploaded ... to MEGA, deleting local copy.`
-
----
-
-## How It Works (Technical Flow)
-
-1. **Startup**
-   - Reads `config.json`.
-   - Sets up logging (console + rotating log file).
-   - Detects your **Windows username** via `getpass.getuser()`.
-   - Ensures the **local root screenshot folder** exists.
-   - If `enable_mega` is `true`, attempts to log into MEGA using `mega.py`.
-
-2. **Screenshot loop**
-   - Every `interval_seconds`:
-     - Builds a **day folder name** like `21-11-2025` from current date.
-     - Ensures `screenshot_folder/21-11-2025/` exists.
-     - Generates a filename: `screenshot_YYYYMMDD_HHMMSS.png`.
-     - Captures the primary monitor with `mss` and saves into the day folder.
-     - Adds the path to an in-memory `pending_screenshots` list.
-
-3. **Rotation**
-   - After each capture, calculates the **total size** of all files under `screenshot_folder`.
-   - If total size in MB > `max_folder_size_mb`:
-     - Sorts all files (all days) by modification time (oldest first).
-     - Deletes old files **unless they are still in `pending_screenshots`**.
-
-4. **Uploading to MEGA**
-   - When the number of `pending_screenshots` is ≥ `upload_batch_size`:
-     - If not logged in yet or previous login failed, retries `Mega().login(...)`.
-     - For each file in the batch:
-       - Determines its day folder (`DD-MM-YYYY`) from the filename or mtime.
-       - Ensures a corresponding MEGA folder `<username>/<day>` exists using `create_folder` (works like `mkdir -p`).
-       - Uploads the file using `mega_client.upload(...)`.
-       - On **success**:
-         - Deletes the local file (`Path.unlink()` – no Recycle Bin).
-         - Removes path from `pending_screenshots`.
-       - On **failure** (network down, MEGA error):
-         - Leaves the file on disk and in `pending_screenshots` for retry.
-
-5. **Offline behavior**
-   - If MEGA login fails at startup, or connection is lost later:
-     - The app **still takes screenshots** and stores them locally.
-     - Uploads are simply skipped (files remain in `pending_screenshots`).
-   - As soon as login succeeds again, the app will start uploading **all pending** files (in batches) until everything is synced.
-
----
-
-## Setup Instructions
-
-### 1. Clone / copy the project
-
-Place the files somewhere, e.g.:
-
-```text
-C:\Users\<You>\Desktop\Github\shotlogger\
-    app.py
-    config.json
-```
-
-If `config.json` does not exist on first run, the app will create a default one and exit so you can edit it.
-
----
-
-### 2. Install Python 3.10
-
-1. Download Python 3.10 from the official Python website.
-2. During installation, check **"Add Python to PATH"**.
-3. Confirm:
-
-   ```powershell
-   py -3.10 --version
-   ```
-
----
-
-### 3. Create and activate a virtual environment
-
-From your `shotlogger` folder:
-
-```powershell
-cd C:\Users\<You>\Desktop\Github\shotlogger
-
-py -3.10 -m venv venv
-.\venv\Scripts\activate
-```
-
-You should see `(venv)` in your shell prompt.
-
----
-
-### 4. Install Python dependencies
-
-Inside the activated venv:
-
-```powershell
-pip install --upgrade pip
-pip install mss mega.py
-```
-
----
-
-### 5. Configure `config.json`
-
-Edit `config.json` and set:
-
-- Your desired `interval_seconds`
-- `screenshot_folder` (e.g. `"C:/Users/CiscoAnass/Pictures/Security"`)
-- Set `enable_mega` to `true` or `false`
-- If `true`, set `mega_email` and `mega_password` for your MEGA account.
-
-Example:
-
-```json
-{
-    "interval_seconds": 10,
-    "screenshot_folder": "C:/Users/CiscoAnass/Pictures/Security",
-    "enable_mega": true,
-    "mega_email": "my_megalogger_account@example.com",
-    "mega_password": "VeryStrongPassword123!",
-    "upload_batch_size": 10,
-    "max_folder_size_mb": 500,
-    "log_file": "screen_guard.log"
-}
-```
-
----
-
-### 6. Run the app (Python)
-
-From the `shotlogger` folder:
+You can test with:
 
 ```powershell
 .\venv\Scripts\activate
-python app.py
+python .\app.py
 ```
 
-You should see log output similar to:
+Check `screen_guard.log` and your server’s `root_folder` to confirm uploads are working.
 
-```text
-[2025-11-20 21:21:02] [INFO] ScreenGuard started. This program only logs YOUR OWN screen on YOUR machine.
-[2025-11-20 21:21:02] [INFO] Using screenshot folder: C:\Users\CiscoAnass\Pictures\Security
-[2025-11-20 21:21:02] [INFO] Interval: 10 seconds
-[2025-11-20 21:21:02] [INFO] Folder size limit: 500.00 MB
-[2025-11-20 21:21:02] [INFO] MEGA uploads are ENABLED.
-[2025-11-20 21:21:12] [INFO] Screenshot saved: C:\Users\...\21-11-2025\screenshot_20251121_212112.png
-...
-```
+### 4.3 Build the EXE
 
-Stop the app with **Ctrl + C**.
-
----
-
-## Building a `.exe` with PyInstaller
-
-> The `.exe` is still completely transparent:  
-> – It shows up in Task Manager as a normal process.  
-> – We do **NOT** use any stealth or malware-like persistence.
-
-### 1. Install PyInstaller in the venv
+Use PyInstaller to build a single‑file EXE with a clean, honest name (e.g. `ShotLogger.exe`):
 
 ```powershell
 .\venv\Scripts\activate
-pip install pyinstaller
+
+pyinstaller --onefile --noconsole `
+  --icon="C:\Users\YourUser\Desktop\shotlogger\shotlogger.ico" `
+  --name="ShotLogger" `
+  "C:\Users\YourUser\Desktop\shotlogger\app.py"
 ```
 
-### 2. Build the EXE
-
-From the project folder:
-
-```powershell
-pyinstaller --onefile --noconsole --icon="C:\Users\CiscoAnass\Desktop\Github\shotlogger\edge.ico" --name="Microsoft Edge" "C:\Users\CiscoAnass\Desktop\Github\shotlogger\app.py"
-```
-
-This will create a folder:
+After it finishes, you will get:
 
 ```text
-dist/
-└─ Microsoft Edge.exe
+C:\Users\YourUser\Desktop\shotlogger\dist\ShotLogger.exe
 ```
 
-Important:
+This file is what you deploy to your Windows PCs.
 
-- Copy `config.json` into the same `dist` folder as the EXE.
-- Make sure `screenshot_folder` in `config.json` is accessible for your user.
-
-> Note: Naming the EXE `"Microsoft Edge"` and giving it an Edge icon will make it look like Edge in File Explorer, but it still runs only what **you** configured and stays visible in Task Manager. Do **not** use this naming to deceive other users.
 
 ---
 
-## Auto-start at Windows Login (Task Scheduler)
+## 5. Deploying to Each Windows PC
 
-1. Press **Win + R**, type `taskschd.msc`, press Enter.
-2. In the right panel, click **Create Task…**.
+You do **not** need Python on every PC, only the EXE + config.
 
-### General tab
+### 5.1 Folder layout on the target PC
 
-- Name: e.g. `ShotLogger - Personal Screen Logger`
-- Description: `Takes periodic screenshots of my own desktop for personal security documentation.`
-- Security options:
-  - Select your user account.
-  - Choose **"Run only when user is logged on"**.
+On each Windows machine, choose a folder like:
 
-### Triggers tab
+```text
+C:\Program Files\ShotLogger\
+```
 
-- Click **New…**
-- Begin the task: **At log on**
-- Settings: `Specific user` (your account)
-- Enabled: ✔
+Copy into that folder:
 
-### Actions tab
+- `ShotLogger.exe`
+- `config.json`
 
-- Click **New…**
-- Action: **Start a program**
-- Program/script: browse to your EXE, e.g.  
-  `C:\Users\<You>\Desktop\Github\shotlogger\dist\Microsoft Edge.exe`
-- Start in (optional): the folder containing the EXE, e.g.  
-  `C:\Users\<You>\Desktop\Github\shotlogger\dist`
+You can adjust `config.json` per machine if needed (e.g. different `screenshot_folder`).
 
-Click **OK** to save.
+### 5.2 Create a Scheduled Task (run at user login)
 
-### Test the task
+1. Open **Task Scheduler**.
+2. Click **Create Task…** (not “Basic Task” for more options if you prefer).
+3. **General** tab:
+   - Name: `ShotLogger`
+   - “Run only when user is logged on” (recommended for a transparent tool).
+4. **Triggers** tab → **New…**:
+   - Begin the task: “At log on”
+   - Settings: “Any user” or a specific user (your choice).
+5. **Actions** tab → **New…**:
+   - Action: “Start a program”
+   - Program/script: `C:\Program Files\ShotLogger\ShotLogger.exe`
+   - Start in (optional but recommended): `C:\Program Files\ShotLogger\`
+6. Click **OK** to save.
 
-- In Task Scheduler, right-click your task → **Run**.
-- Check:
-  - The log file (`screen_guard.log`)
-  - The screenshot folder
-  - MEGA (if enabled) for uploaded screenshots
+Now, each time that user logs in, `ShotLogger.exe` will start, capture screenshots, and upload them to your Tor server.
 
 ---
 
-## Security & Privacy Notes
+## 6. How the Client Behaves
 
-- This tool **must only be used on your own machines** and accounts.
-- Never use it on:
-  - Shared / public computers
-  - Work machines without explicit written permission
-  - Systems belonging to others
-- All credentials in `config.json` (MEGA email/password) are sensitive:
-  - Keep the file private.
-  - Consider using a dedicated MEGA account just for this logger.
-- Screenshots may contain very sensitive data (passwords, chats, banking, etc.):
-  - Protect your MEGA account with a strong password and 2FA.
-  - Periodically review and clean up old screenshots in the cloud if you don’t need them.
+- On startup:
+  - Loads `config.json` from the same directory as the EXE.
+  - Ensures the `screenshot_folder` exists.
+  - Scans that folder for existing `*.png` files and treats them as **pending uploads** (useful when internet / Tor was down).
+- Every `interval_seconds`:
+  - Creates a folder for today: `DD-MM-YYYY` inside the screenshot folder.
+  - Captures a screenshot into `screenshot_YYYYMMDD_HHMMSS.png` inside that day folder.
+  - Adds the new file to the **pending** list.
+  - Runs **rotation** if total size > `max_folder_size_mb`, deleting oldest files that are not currently pending.
+- Upload logic:
+  - When `pending` length ≥ `upload_batch_size`, it tries to upload them to `server_url + "/api/upload"`
+    via the Tor SOCKS proxy (`tor_socks_proxy`).
+  - Sends:
+    - `username` – the Windows username (`getpass.getuser()`).
+    - `day` – derived from filename or file’s mtime (`DD-MM-YYYY`).
+    - `file` – the PNG screenshot.
+    - Header `X-Upload-Password: <upload_password>`.
+  - On HTTP 200 → deletes the local file.
+  - On error → keeps the file for the next attempt.
 
 ---
 
-## Disclaimer
+## 7. How the Server Behaves
 
-This software is provided **as-is**, with no warranty.  
-You are fully responsible for:
+- Reads `server_config.json` at startup.
+- Stores screenshots under:
 
-- How you configure and use it  
-- Compliance with local laws and regulations  
-- Protection of your own data and credentials
+  ```text
+  root_folder / <username> / <day> / <filename>.png
+  ```
 
-Use it **ethically**, **legally**, and **only for your own personal logging and security documentation**.
+- Web UI structure:
+  - `/login` → login form (Tor only)
+  - `/` → list of users
+  - `/user/<username>` → list of days & file counts
+  - `/user/<username>/<day>` → grid of thumbnails
+  - Clicking a thumbnail opens a **full preview modal**.
+- API endpoint for uploads:
+  - `POST /api/upload`
+  - Requires header `X-Upload-Password` equal to `upload_password` in `server_config.json`.
+  - Form fields:
+    - `username`
+    - `day` (optional; if empty, server uses current UTC date)
+    - `file` → screenshot
+  - Rejects bad credentials or invalid paths with error JSON.
+
+---
+
+## 8. Security & Ethics
+
+- This tool is intentionally designed for **personal use on your own machines**:
+  - You own the Debian server.
+  - You own the Windows PCs / user accounts.
+- Do **not** deploy it on machines you don’t own, or users you don’t have a clear agreement with.
+- The client:
+  - Uses a clear folder (`ShotLogger`, `ShotLogger.exe`) if you choose so.
+  - Uses standard, legitimate persistence (Windows Task Scheduler).
+  - Avoids stealth techniques like hiding processes, rootkits, registry abuse, etc.
+- Network:
+  - Traffic is routed via **Tor** to your hidden service, which protects your server’s IP.
+  - Use strong `web_password`, `upload_password`, and `session_secret` in `server_config.json`.
+- Antivirus:
+  - Some AV engines may flag any app that captures screens + auto‑starts + talks over Tor.
+  - Since this is just for your own lab, the most honest way to handle that is:
+    - Use a clear, honest program name (`ShotLogger.exe`).
+    - Add an **exception** in your own AV for this file/folder if needed.
+
+---
+
+## 9. Troubleshooting
+
+### 9.1 No users appear in the web UI
+
+- Check that screenshots are actually being created on Windows:
+  - Look inside `screenshot_folder` (and sub‑folders by date).
+- Check that uploads succeed:
+  - Look at the Windows log file (`screen_guard.log` next to the EXE).
+  - Look under `root_folder` on Debian:
+    ```bash
+    ls -R /home/youruser/shotlogger_data
+    ```
+- If you only see folders on disk but not in UI, ensure:
+  - `root_folder` in `server_config.json` is exactly the parent directory containing the username folders.
+
+### 9.2 401 Unauthorized in logs
+
+- Means `upload_password` in Windows `config.json` does **not** match `upload_password` in `server_config.json`.
+- Fix both to use the same secret string.
+
+### 9.3 Tor / network issues
+
+- On Debian:
+  - Check Tor status: `sudo systemctl status tor`
+- On Windows:
+  - Ensure Tor Browser or Tor service is running.
+  - Verify the `tor_socks_proxy` in `config.json`:
+    - `socks5h://127.0.0.1:9050` (Tor service)
+    - `socks5h://127.0.0.1:9150` (Tor Browser)
+- Check Windows logs for errors like “Network error while uploading …”.
+
+### 9.4 Disk usage growing too much on Windows
+
+- Lower `max_folder_size_mb` in `config.json`.
+- Increase `upload_batch_size` so uploads happen more frequently.
+- Make sure the server is reachable so uploads can succeed and local files are removed.
+
+---
+
+## 10. Notes
+
+- All code and config here is intentionally **simple and transparent**.
+- You are responsible for how you use this tool; keep it ethical and legal.
+- If you expand it (tray icon, GUI, encryption, multi‑user web auth, etc.), keep the same principles:
+  - No stealth.
+  - Clear configuration.
+  - Respect for privacy and consent.
+ 
