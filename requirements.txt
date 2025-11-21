@@ -1,4 +1,6 @@
 mss
 requests
 pyinstaller
-mega.py
+pysocks
+flask
+python-dotenv
