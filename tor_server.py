@@ -734,7 +734,6 @@ USER_TEMPLATE = """
 </body>
 </html>
 """
-
 DAY_TEMPLATE = """
 <!doctype html>
 <html lang="en">
@@ -827,10 +826,13 @@ DAY_TEMPLATE = """
       justify-content: space-between;
       margin-bottom: 24px;
       padding: 12px 0;
+      flex-wrap: wrap;
+      gap: 8px;
     }
     .view-controls {
       display: flex;
       gap: 8px;
+      flex-wrap: wrap;
     }
     .btn-view {
       padding: 8px 12px;
@@ -855,32 +857,82 @@ DAY_TEMPLATE = """
       font-size: 14px;
       color: #5f6368;
     }
+
+    /* GRID VIEWS */
     .photo-grid {
+      margin-bottom: 40px;
+    }
+    .photo-grid.grid-mode {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
       gap: 4px;
-      margin-bottom: 40px;
     }
-    .photo-grid.comfortable {
+    .photo-grid.grid-mode.comfortable {
       gap: 8px;
       grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
     }
-    .photo-grid.cozy {
+    .photo-grid.grid-mode.cozy {
       gap: 16px;
       grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
     }
+
     .photo-item {
       position: relative;
       cursor: pointer;
       overflow: hidden;
       background: #f8f9fa;
-      border-radius: 2px;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+    }
+
+    /* GRID item style */
+    .photo-grid.grid-mode .photo-item {
+      flex-direction: column;
       aspect-ratio: 1;
     }
-    .photo-grid.comfortable .photo-item,
-    .photo-grid.cozy .photo-item {
-      border-radius: 4px;
+
+    .photo-thumb-img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transition: transform 0.2s;
     }
+    .photo-grid.grid-mode .photo-item:hover .photo-thumb-img {
+      transform: scale(1.05);
+    }
+    .photo-grid.grid-mode .photo-item:hover::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.1);
+    }
+
+    /* LIST VIEW */
+    .photo-grid.list-mode {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .photo-grid.list-mode .photo-item {
+      height: 40px;
+      padding: 0 12px;
+      flex-direction: row;
+      justify-content: flex-start;
+    }
+    /* In LIST mode we do NOT show thumbnails at all */
+    .photo-grid.list-mode .photo-thumb-img {
+      display: none;
+    }
+    .photo-filename {
+      font-size: 13px;
+      color: #202124;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      flex: 1;
+    }
+
     .photo-delete-form {
       position: absolute;
       top: 6px;
@@ -905,21 +957,7 @@ DAY_TEMPLATE = """
     .photo-delete-button:hover {
       background: rgba(0, 0, 0, 0.8);
     }
-    .photo-item img {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-      transition: transform 0.2s;
-    }
-    .photo-item:hover img {
-      transform: scale(1.05);
-    }
-    .photo-item:hover::after {
-      content: '';
-      position: absolute;
-      inset: 0;
-      background: rgba(0, 0, 0, 0.1);
-    }
+
     .modal {
       display: none;
       position: fixed;
@@ -1040,18 +1078,17 @@ DAY_TEMPLATE = """
       <div class="toolbar">
         <div class="photo-count">{{ files|length }} photo{% if files|length != 1 %}s{% endif %}</div>
         <div class="view-controls">
-          <button class="btn-view active" onclick="setView('compact')">Compact</button>
-          <button class="btn-view" onclick="setView('comfortable')">Comfortable</button>
-          <button class="btn-view" onclick="setView('cozy')">Cozy</button>
+          <button class="btn-view active" data-view="list" onclick="setView('list', this)">List</button>
+          <button class="btn-view" data-view="compact" onclick="setView('compact', this)">Compact</button>
+          <button class="btn-view" data-view="comfortable" onclick="setView('comfortable', this)">Comfortable</button>
+          <button class="btn-view" data-view="cozy" onclick="setView('cozy', this)">Cozy</button>
         </div>
       </div>
 
-      <div class="photo-grid" id="photoGrid">
+      <div class="photo-grid list-mode" id="photoGrid">
         {% for fname in files %}
-          <div class="photo-item" onclick="openModal({{ loop.index0 }})">
-            <img src="{{ url_for('serve_file', username=username, day=day, filename=fname) }}" 
-                 alt="{{ fname }}"
-                 loading="lazy">
+          <div class="photo-item" data-index="{{ loop.index0 }}" onclick="openModal({{ loop.index0 }})">
+            <div class="photo-filename">{{ fname }}</div>
             <form class="photo-delete-form"
                   method="POST"
                   action="{{ url_for('delete_file', username=username, day=day, filename=fname) }}"
@@ -1099,18 +1136,50 @@ DAY_TEMPLATE = """
 
     let currentIndex = 0;
 
-    function setView(view) {
+    function ensureThumbnailsForGrid() {
+      const grid = document.getElementById('photoGrid');
+      if (!grid.classList.contains('grid-mode')) {
+        return;
+      }
+      const items = document.querySelectorAll('.photo-item');
+      items.forEach(item => {
+        if (item.querySelector('img')) return;
+        const idx = parseInt(item.getAttribute('data-index'), 10);
+        const img = document.createElement('img');
+        img.className = 'photo-thumb-img';
+        img.alt = photos[idx].filename;
+        img.loading = 'lazy';
+        img.src = photos[idx].url;
+        item.insertBefore(img, item.firstChild);
+      });
+    }
+
+    function setView(view, btn) {
       const grid = document.getElementById('photoGrid');
       const buttons = document.querySelectorAll('.btn-view');
-      
-      buttons.forEach(btn => btn.classList.remove('active'));
-      event.target.classList.add('active');
-      
-      grid.className = 'photo-grid';
-      if (view !== 'compact') {
-        grid.classList.add(view);
+
+      buttons.forEach(b => b.classList.remove('active'));
+
+      if (btn) {
+        btn.classList.add('active');
+      } else {
+        const match = document.querySelector('.btn-view[data-view="' + view + '"]');
+        if (match) {
+          match.classList.add('active');
+        }
       }
-      
+
+      grid.className = 'photo-grid';
+      if (view === 'list') {
+        grid.classList.add('list-mode');
+      } else {
+        grid.classList.add('grid-mode');
+        if (view === 'comfortable') grid.classList.add('comfortable');
+        if (view === 'cozy') grid.classList.add('cozy');
+        // Only now we create thumbnails and load images
+        ensureThumbnailsForGrid();
+      }
+
       localStorage.setItem('photoGridView', view);
     }
 
@@ -1122,7 +1191,7 @@ DAY_TEMPLATE = """
     }
 
     function closeModal(event) {
-      if (event && event.target.classList.contains('modal-content')) {
+      if (event && event.target && event.target.classList && event.target.classList.contains('modal-content')) {
         return;
       }
       document.getElementById('modal').classList.remove('active');
@@ -1138,9 +1207,10 @@ DAY_TEMPLATE = """
 
     function updateModal() {
       const photo = photos[currentIndex];
-      document.getElementById('modalImage').src = photo.url;
+      const img = document.getElementById('modalImage');
+      img.src = photo.url;  // image is loaded ONLY here for list mode
       document.getElementById('modalFilename').textContent = photo.filename;
-      
+
       document.getElementById('prevBtn').disabled = currentIndex === 0;
       document.getElementById('nextBtn').disabled = currentIndex === photos.length - 1;
     }
@@ -1148,7 +1218,7 @@ DAY_TEMPLATE = """
     document.addEventListener('keydown', function(e) {
       const modal = document.getElementById('modal');
       if (!modal.classList.contains('active')) return;
-      
+
       if (e.key === 'Escape') {
         closeModal();
       } else if (e.key === 'ArrowLeft') {
@@ -1158,20 +1228,14 @@ DAY_TEMPLATE = """
       }
     });
 
-    const savedView = localStorage.getItem('photoGridView');
-    if (savedView && savedView !== 'compact') {
-      document.getElementById('photoGrid').classList.add(savedView);
-      document.querySelectorAll('.btn-view').forEach(btn => {
-        btn.classList.remove('active');
-        if (btn.textContent.toLowerCase() === savedView) {
-          btn.classList.add('active');
-        }
-      });
-    }
+    // Restore last selected view; default to LIST
+    const savedView = localStorage.getItem('photoGridView') || 'list';
+    setView(savedView);
   </script>
 </body>
 </html>
 """
+
 
 # ==========================================================
 #  Web routes
